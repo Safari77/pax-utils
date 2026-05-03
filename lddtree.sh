@@ -45,8 +45,10 @@ elf_specs() {
 		sed -E 's: (LINUX|GNU)$: NONE:'
 }
 
-lib_paths_fallback="${ROOT}lib* ${ROOT}usr/lib* ${ROOT}usr/local/lib* ${ROOT}usr/X11R6/lib*"
+# Expand globs securely into an array for fallback paths
+lib_paths_fallback=( "${ROOT}lib"* "${ROOT}usr/lib"* "${ROOT}usr/local/lib"* "${ROOT}usr/X11R6/lib"* )
 c_ldso_paths_loaded='false'
+
 find_elf() {
 	_find_elf=''
 
@@ -58,7 +60,7 @@ find_elf() {
 		check_paths() {
 			local elf=$1 ; shift
 			local path pe
-			for path ; do
+			for path in "$@" ; do
 				pe="${path%/}/${elf#/}"
 				if [[ -e ${pe} ]] ; then
 					if [[ $(elf_specs "${pe}") == "${elf_specs}" ]] ; then
@@ -72,20 +74,19 @@ find_elf() {
 
 		if [[ ${c_last_needed_by} != ${needed_by} ]] ; then
 			c_last_needed_by=${needed_by}
-			c_last_needed_by_rpaths=$(scanelf -qF '#F%r' "${needed_by}" | \
-				sed -E -e 's|:| |g' -e "s:[$](ORIGIN|\{ORIGIN\}):${needed_by%/*}:")
+			# Maintain colon separation and read into an array to avoid globbing/word splitting
+			local rpaths_raw=$(scanelf -qF '#F%r' "${needed_by}" | \
+				sed -E "s:[$](ORIGIN|\{ORIGIN\}):${needed_by%/*}:")
+			IFS=: read -r -a c_last_needed_by_rpaths <<< "${rpaths_raw}"
 		fi
-		check_paths "${elf}" ${c_last_needed_by_rpaths} && return 0
+		check_paths "${elf}" "${c_last_needed_by_rpaths[@]}" && return 0
 
 		if [[ -n ${LD_LIBRARY_PATH} ]] ; then
 			# Need to handle empty paths as $PWD,
-			# and handle spaces in between the colons
-			local p path=${LD_LIBRARY_PATH}
-			while : ; do
-				p=${path%%:*}
+			# and handle spaces in between the colons safely via array
+			IFS=: read -r -a ld_lib_path_array <<< "${LD_LIBRARY_PATH}"
+			for p in "${ld_lib_path_array[@]}" ; do
 				check_paths "${elf}" "${p:-${PWD}}" && return 0
-				[[ ${path} == *:* ]] || break
-				path=${path#*:}
 			done
 		fi
 
@@ -95,14 +96,14 @@ find_elf() {
 			if [[ -r ${ROOT}etc/ld.so.conf ]] ; then
 				read_ldso_conf() {
 					local line p
-					for p ; do
+					for p in "$@" ; do
 						# If the glob didn't match anything #360041,
 						# or the files aren't readable, skip it.
 						[[ -r ${p} ]] || continue
-						while read line ; do
+						while read -r line ; do
 							case ${line} in
 								"#"*) ;;
-								"include "*) read_ldso_conf ${line#* } ;;
+								"include "*) read_ldso_conf "${line#* }" ;;
 								*) c_ldso_paths+=( "${ROOT}${line#/}" ) ;;
 							esac
 						done <"${p}"
@@ -110,7 +111,7 @@ find_elf() {
 				}
 				# the 'include' command is relative
 				pushd "${ROOT}"etc >/dev/null
-				read_ldso_conf "${ROOT}"etc/ld.so.conf
+				read_ldso_conf "${ROOT}etc/ld.so.conf"
 				popd >/dev/null
 			fi
 		fi
@@ -118,7 +119,7 @@ find_elf() {
 			check_paths "${elf}" "${c_ldso_paths[@]}" && return 0
 		fi
 
-		check_paths "${elf}" ${lib_paths_fallback} && return 0
+		check_paths "${elf}" "${lib_paths_fallback[@]}" && return 0
 	fi
 	return 1
 }
@@ -140,7 +141,7 @@ show_elf() {
 	if ${LIST} ; then
 		echo "${resolved:-$1}"
 	else
-		printf "${resolved:-not found}"
+		printf "%s" "${resolved:-not found}"
 	fi
 	if [[ ${indent} -eq 0 ]] ; then
 		local elf_specs interp full_interp
@@ -152,7 +153,7 @@ show_elf() {
 		if ${LIST} ; then
 			[[ -n ${interp} ]] && echo "${interp}"
 		else
-			printf " (interpreter => ${interp:-none})"
+			printf " (interpreter => %s)" "${interp:-none}"
 		fi
 		full_interp=${interp}
 		interp=${interp##*/}
@@ -174,7 +175,10 @@ show_elf() {
 		allhits+=",${libs}"
 	fi
 
-	for lib in ${libs//,/ } ; do
+	# Safely iterate through comma-separated dependencies without globbing
+	IFS=, read -r -a lib_array <<< "${libs}"
+	for lib in "${lib_array[@]}" ; do
+		[[ -z ${lib} ]] && continue
 		lib=${lib##*/}
 		# No need for leading comma w/my_allhits as we guarantee it always
 		# starts with one due to the way we append the value above.
@@ -227,7 +231,7 @@ shift $((OPTIND - 1))
 ${SET_X} && set -x
 
 ret=0
-for elf ; do
+for elf in "$@" ; do
 	unset c_last_needed_by
 	if ${AUTO_ROOT} && [[ ${elf} == /* ]] ; then
 		elf="${ROOT}${elf#/}"

@@ -47,6 +47,7 @@ import glob
 import mmap
 import os
 import re
+import shlex
 import shutil
 import sys
 from typing import Any, cast, Dict, Iterable, List, Optional, Tuple, Union
@@ -126,7 +127,12 @@ def readlink(path: str, root: str, prefixed: Optional[bool] = False) -> str:
     if prefixed:
         path = path[len(root) :]
 
+    depth = 0
     while os.path.islink(root + path):
+        if depth >= 40:
+            warn(f"symlink loop detected resolving: {path}")
+            break
+        depth += 1
         path = os.path.join(os.path.dirname(path), os.readlink(root + path))
 
     return normpath((root + path) if prefixed else path)
@@ -147,6 +153,11 @@ def interp_supports_argv0(interp: str) -> bool:
     with open(interp, "rb") as fp:
         with mmap.mmap(fp.fileno(), 0, prot=mmap.PROT_READ) as mm:
             return mm.find(b"--argv0") >= 0
+
+
+def shell_escape(s: str) -> str:
+    """Escape characters for safe inclusion inside double quotes in a shell script."""
+    return s.replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`').replace('$', '\\$')
 
 
 def GenerateLdsoWrapper(
@@ -180,14 +191,21 @@ def GenerateLdsoWrapper(
             for x in re.split(r"[ :]", preload)
         )
 
+    # Sanitize variables that will be directly dumped into a double-quoted bash string
+    interp_escaped = shell_escape(os.path.join(os.path.relpath(interp_dir, basedir), interp_name))
+    interp_rel_escaped = shell_escape(os.path.relpath(path, interp_dir))
+    libpaths_str = ":".join("${basedir}/" + shell_escape(os.path.relpath(p, basedir)) for p in libpaths)
+
+    preload_arg = ""
+    if preload:
+        preload_arg = f'--preload {shlex.quote(preload)}'
+
     replacements = {
-        "interp": os.path.join(os.path.relpath(interp_dir, basedir), interp_name),
-        "interp_rel": os.path.relpath(path, interp_dir),
-        "libpaths": ":".join(
-            "${basedir}/" + os.path.relpath(p, basedir) for p in libpaths
-        ),
+        "interp": interp_escaped,
+        "interp_rel": interp_rel_escaped,
+        "libpaths": libpaths_str,
         "argv0_arg": '--argv0 "$0"' if interp_supports_argv0(root + interp) else "",
-        "preload_arg": f'--preload "{preload}"' if preload else "",
+        "preload_arg": preload_arg,
     }
 
     # Keep path relativeness of argv0 (in ${base}.elf). This allows tools to
@@ -586,6 +604,11 @@ def ParseELF(
         # Search for the libs this ELF uses.
         all_ldpaths = None
         for lib in libs:
+            # Prevent path traversal vulnerabilities
+            if "/" in lib:
+                warn(f"skipping library with directory traversal characters: {lib}")
+                continue
+
             if lib in _all_libs:
                 continue
             if all_ldpaths is None:
@@ -690,7 +713,9 @@ def _ActionCopy(options: argparse.Namespace, elf: dict):
     """Copy the ELF and its dependencies to a destination tree"""
 
     def _StripRoot(path: str) -> str:
-        return path[len(options.root) - 1 :]
+        # Strip root and strictly normalize to prevent arbitrary path traversal writes
+        stripped = path[len(options.root) - 1 :]
+        return "/" + os.path.normpath("/" + stripped).lstrip("/")
 
     def _copy(
         realsrc,

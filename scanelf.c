@@ -1329,7 +1329,7 @@ static char *scanelf_file_sym(elfobj *elf, char *found_sym)
 			symname = elf->cdata + EGET(strtab->sh_offset) + EGET(sym->st_name); \
 			if (EGET(sym->st_name) >= (uint64_t)elf->len || \
 			    EGET(strtab->sh_offset) + EGET(sym->st_name) >= (uint64_t)elf->len || \
-			    !memchr(symname, 0, elf->len - EGET(strtab->sh_offset) + EGET(sym->st_name))) \
+			    !memchr(symname, 0, elf->len - (EGET(strtab->sh_offset) + EGET(sym->st_name)))) \
 				goto break_out; \
 			scanelf_match_symname(elf, found_sym, \
 			                      &ret, &ret_len, symname, \
